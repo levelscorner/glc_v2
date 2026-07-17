@@ -66,3 +66,22 @@ POST path (`msg.channel != name` → `400`).
 **Verify:** matched `telegram` envelope proceeds; `discord`-on-`telegram` →
 rejected with "channel mismatch: envelope declares 'discord' on route
 'telegram'", socket closed, no echo. 249/249 tests still pass.
+
+## C1 — SSRF via `/v1/vision` image resolver  ·  invariant 2  ·  HIGH
+
+**Reproduce:** send a chat/vision request with an `image_url` block pointing
+at an internal address (`http://169.254.169.254/…`, `http://127.0.0.1:8111/…`,
+a private IP). Pre-fix `_resolve_image_urls` fetches it with
+`follow_redirects=True` and no allowlist — the gateway proxies internal
+resources, and a public URL can 302 into the private network.
+
+**Fix:** `glc/security/ssrf.py` — `check_url_allowed()` rejects non-http(s)
+schemes and any host that resolves to a private/loopback/link-local/
+multicast/reserved/unspecified address (v4+v6), with an optional
+`GLC_IMAGE_URL_ALLOWLIST`. `_resolve_image_urls` now disables auto-redirects
+and re-validates every hop (max 5). Residual: DNS-rebinding (pin-IP) noted as
+follow-up.
+
+**Verify:** metadata IP, `127.0.0.1:8111`, `10/8`, `192.168/16`, `::1`,
+`ftp://`, `file://` all blocked; public hosts allowed; allowlist enforced.
+249/249 tests pass.

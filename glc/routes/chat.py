@@ -290,20 +290,42 @@ async def _resolve_image_urls(messages):
 
     import httpx as _httpx
 
+    from glc.security.ssrf import check_url_allowed
+
+    _MAX_REDIRECTS = 5
+
     async def _fetch_to_data_url(url: str) -> str:
+        # C1 fix: SSRF guard. Validate the target host resolves to a global
+        # address (and passes any allowlist) before every hop, and follow
+        # redirects manually so a public URL cannot 302 into the private net.
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        current = url
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
+            for _ in range(_MAX_REDIRECTS + 1):
+                ok, why = check_url_allowed(current)
+                if not ok:
+                    raise HTTPException(400, f"blocked image url: {why}")
+                try:
+                    r = await c.get(current)
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
+                if r.is_redirect:
+                    loc = r.headers.get("location", "")
+                    if not loc:
+                        raise HTTPException(400, f"redirect without location for {url!r}")
+                    current = str(r.url.join(loc))
+                    continue
+                try:
+                    r.raise_for_status()
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
+                mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+                b64 = base64.b64encode(r.content).decode()
+                return f"data:{mt};base64,{b64}"
+            raise HTTPException(400, f"too many redirects fetching image url {url!r}")
 
     out = []
     for m in messages:
