@@ -85,3 +85,17 @@ follow-up.
 **Verify:** metadata IP, `127.0.0.1:8111`, `10/8`, `192.168/16`, `::1`,
 `ftp://`, `file://` all blocked; public hosts allowed; allowlist enforced.
 249/249 tests pass.
+
+## C4 — Verbose upstream errors leaked to client  ·  invariant 2  ·  MEDIUM
+
+**Reproduce:** a failing `/v1/chat` or `/v1/embed` returns the raw provider
+exception, the provider name, and the full `all_attempts` list in the HTTP
+error body — free internal detail for an attacker.
+
+**Fix:** `glc/routes/chat.py` — client-facing raises now return generic
+messages ("upstream provider error", "all upstream providers unavailable",
+"upstream embed error"); full detail (provider, exception) goes to the
+`glc.chat` logger and the cost-ledger `error` column, not the client.
+
+**Verify:** 249/249 tests pass (no test depended on the leaked strings);
+error bodies no longer echo provider internals.
