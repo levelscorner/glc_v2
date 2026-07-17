@@ -99,3 +99,17 @@ messages ("upstream provider error", "all upstream providers unavailable",
 
 **Verify:** 249/249 tests pass (no test depended on the leaked strings);
 error bodies no longer echo provider internals.
+
+## C5 — No rate limit / budget on the public data plane  ·  invariant 8  ·  HIGH
+
+**Reproduce:** the existing limiter only covers the WS/webhook channel path;
+`/v1/chat`, `/v1/embed`, `/v1/vision`, `/v1/speak`, `/v1/transcribe` accept
+unbounded requests from any IP — DoS and denial-of-wallet on a shared account.
+
+**Fix:** `glc/security/http_ratelimit.py` — `DataPlaneRateLimitMiddleware`, a
+per-client-IP sliding-60s-window limiter (`GLC_DATAPLANE_RPM`, default 60),
+added ahead of auth so floods are throttled first; returns 429 + `Retry-After`.
+Token/cost budgets ride on the cost ledger and are a documented follow-up.
+
+**Verify:** cap 3 → `[400,400,400,429,429]` on `/v1/embed`; `/healthz`
+unthrottled; 249/249 tests pass.
