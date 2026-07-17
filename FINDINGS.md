@@ -50,3 +50,19 @@ None`) when `GLC_DISABLE_DOCS=1` on the deployment.
 
 **Verify:** info endpoints → `401` without token; `/docs` and `/openapi.json`
 → `404` on the deployment.
+
+## Leak 9 / C2 — Cross-channel envelope spoofing  ·  invariant 3  ·  HIGH
+
+**Reproduce:** connect to `WS /v1/channels/telegram` (with the install token)
+and send a `ChannelMessage` whose `channel="discord"`. Pre-fix the gateway
+processes it as Discord — the Telegram adapter has impersonated another channel.
+
+**Fix:** `glc/routes/channels.py` — after validating the envelope, reject any
+message whose `env.channel` differs from the route `name`: record a
+`channel_spoof` audit event, send a `channel mismatch` error, and close the
+socket (`WS_1008_POLICY_VIOLATION`). The same check is applied on the webhook
+POST path (`msg.channel != name` → `400`).
+
+**Verify:** matched `telegram` envelope proceeds; `discord`-on-`telegram` →
+rejected with "channel mismatch: envelope declares 'discord' on route
+'telegram'", socket closed, no echo. 249/249 tests still pass.
