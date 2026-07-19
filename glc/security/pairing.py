@@ -198,6 +198,23 @@ class PairingStore:
                    VALUES (?,?,?,?,?)""",
                 (channel, channel_user_id, user_handle, "owner_paired", paired_at),
             )
+        # Leak 3 mitigation (detection): owner escalation is the highest-impact
+        # pairing change, and in glc_v1 any in-process caller can reach this
+        # method. Fully closing it is component separation; at minimum, record
+        # every call to the tamper-evident audit log so a silent escalation is
+        # visible after the fact.
+        try:
+            from glc.audit import append as _audit_append
+
+            _audit_append(
+                channel=channel,
+                channel_user_id=channel_user_id,
+                trust_level="owner_paired",
+                event_type="force_pair_owner",
+                result={"user_handle": user_handle},
+            )
+        except Exception:  # audit must never break the pairing path
+            pass
         return PairingRecord(
             channel=channel,
             channel_user_id=channel_user_id,

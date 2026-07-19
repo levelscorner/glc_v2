@@ -141,3 +141,27 @@ cross-container append-only writer is the deeper A6 fix (documented).
 
 **Verify:** 5 clean appends → chain OK; `DELETE id=3` → detected (first_bad=4);
 `UPDATE id=1` → detected (first_bad=1). 249/249 tests pass.
+
+## In-process leaks 1, 3, 4, 5, 8, 10 — shared process = shared blast radius
+
+These all stem from every adapter running in one process with one shared
+environment. The **complete** fix for 1/3/4/5/8 is component separation:
+each adapter in its own Modal Sandbox with its own Secret, scoped
+credentials per tool call, a separate PID namespace, and the policy engine
+in its own process. That is the deployment-layer rework (A3/A4 + capstone
+scope). What is closeable *in code* now:
+
+- **Leak 10 — cost-ledger poisoning ✅ CLOSED (invariant 8).** `glc/db.py`
+  `log_call` now clamps every caller-supplied count (`input_tokens`, …) to a
+  sane ceiling and logs out-of-range values. Verified: `input_tokens=999_999_999`
+  → stored `10_000_000`, warning logged.
+- **Leak 3 — force_pair_owner escalation ⚠️ DETECTION added (invariant 7).**
+  `glc/security/pairing.py` now writes a `force_pair_owner` event to the
+  tamper-evident audit log on every call, so a silent in-process escalation is
+  visible after the fact. Full close = component separation. Verified: attacker
+  escalation produces an audit row.
+- **Leaks 1, 4, 5, 8 — DOCUMENTED, deployment-layer.** Shared env keys (1),
+  in-process install-token read (4), policy monkey-patch (5), and
+  `os.kill(getpid)` (8) cannot be closed from inside a single shared process;
+  they require per-adapter containers / Secrets / PID namespaces. Tracked for
+  the A3/A4 deployment fixes and the capstone.
