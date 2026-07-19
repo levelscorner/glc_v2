@@ -125,6 +125,13 @@ async def channel_webhook_verify(name: str, request: Request):
     token = params.get("hub.verify_token", "")
     challenge = params.get("hub.challenge", "")
     expected = os.environ.get(f"{name.upper()}_VERIFY_TOKEN", "")
+    # Fail closed when no verify token is configured for this channel. Without
+    # this guard, `expected` is "" and hmac.compare_digest(token, "") is True
+    # for an empty presented token, so ANY caller can complete the webhook
+    # subscription handshake for a channel whose {NAME}_VERIFY_TOKEN is unset —
+    # which is the default on a fresh deploy.
+    if not expected:
+        raise HTTPException(status_code=403)
     if mode == "subscribe" and hmac.compare_digest(token, expected):
         return PlainTextResponse(challenge)
     raise HTTPException(status_code=403)
