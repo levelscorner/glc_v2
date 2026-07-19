@@ -34,14 +34,18 @@ router = APIRouter()
 
 @router.websocket("/v1/channels/{name}")
 async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(default=None)):
+    # C3 fix: the install token must arrive in the Authorization header. A
+    # token in the query string (?token=) is written to access logs, proxy
+    # logs, and browser history. The query fallback is disabled unless an
+    # operator explicitly re-enables it for a legacy client.
     header_auth = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
     presented = None
     if header_auth and header_auth.startswith("Bearer "):
         presented = header_auth.removeprefix("Bearer ").strip()
-    elif token:
+    elif token and os.getenv("GLC_ALLOW_WS_QUERY_TOKEN") == "1":
         presented = token
     expected = get_or_create_install_token()
-    if presented != expected:
+    if not presented or not hmac.compare_digest(presented, expected):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
