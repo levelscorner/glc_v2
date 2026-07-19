@@ -165,3 +165,28 @@ scope). What is closeable *in code* now:
   `os.kill(getpid)` (8) cannot be closed from inside a single shared process;
   they require per-adapter containers / Secrets / PID namespaces. Tracked for
   the A3/A4 deployment fixes and the capstone.
+
+## A3–A6 — deployment layer (`modal_app.py`)
+
+The hardening is now switched on for the public deployment, and the image is
+made reproducible:
+
+- **A1/A2/C5 enforced live.** `modal_app.py` sets `GLC_REQUIRE_AUTH=1`,
+  `GLC_DISABLE_DOCS=1`, `GLC_DATAPLANE_RPM=60`. Verified on the public URL:
+  `/v1/chat` and `/v1/status` → **401** without the token, `200`/`502` with it;
+  `/docs` and `/openapi.json` → **404**. (Pre-fix all were open.)
+- **A4 (one Secret) — partially addressed.** The gateway bearer token lives in
+  its own Secret (`glc-gateway-auth`), separate from the provider keys
+  (`glc-llm-keys`) — a distinct credential per surface. Full per-adapter secret
+  isolation is component separation (documented).
+- **A5 (non-reproducible image) — CLOSED (build side).** Every dependency is
+  pinned to its exact `uv.lock` version (no more `>=` drift). Pinning the base
+  image by digest is the remaining step.
+- **A6 (audit db on Volume + autoscale).** Tamper-evidence is provided by the
+  leak-2 hash chain; the concurrent-writer corruption needs a single
+  append-only writer (deeper fix, documented).
+- **A3 (no egress wall).** Requires running adapters as Modal Sandboxes with
+  `outbound_domain_allowlist` — component separation, documented.
+
+Public deployment: `https://rabhinavcs--glc-v1-gateway-fastapi-app.modal.run`
+(scale-to-zero, mock keys only).

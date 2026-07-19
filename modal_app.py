@@ -28,18 +28,33 @@ LOCAL_GLC = Path(__file__).parent / "glc"
 # throwaway container filesystem.
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    # A5 fix: pin every dependency to the exact version resolved in uv.lock
+    # instead of ">=" ranges, so a redeploy cannot silently pull a newer
+    # (possibly poisoned) release — the supply-chain-drift the migration left
+    # open. (Pinning the base image by digest is the further hardening step.)
     .pip_install(
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.27",
-        "httpx>=0.27",
-        "python-dotenv>=1.0",
-        "pydantic>=2.6",
-        "jsonschema>=4.21",
-        "pyyaml>=6.0",
-        "websockets>=12.0",
-        "twilio>=9.0",
+        "fastapi==0.137.1",
+        "uvicorn[standard]==0.49.0",
+        "httpx==0.28.1",
+        "python-dotenv==1.2.2",
+        "pydantic==2.13.4",
+        "jsonschema==4.26.0",
+        "pyyaml==6.0.3",
+        "websockets==16.0",
+        "twilio==9.10.9",
     )
-    .env({"GLC_CONFIG_DIR": "/data/glc"})
+    # Turn the hardening on for the public deployment: require the gateway
+    # bearer token (A1), disable Swagger/OpenAPI (A2), and cap the data-plane
+    # request rate (C5). GLC_GATEWAY_TOKEN itself arrives via the Secret below,
+    # so it is never baked into the image.
+    .env(
+        {
+            "GLC_CONFIG_DIR": "/data/glc",
+            "GLC_REQUIRE_AUTH": "1",
+            "GLC_DISABLE_DOCS": "1",
+            "GLC_DATAPLANE_RPM": "60",
+        }
+    )
     .add_local_dir(str(LOCAL_GLC), remote_path="/root/glc")
 )
 
@@ -51,11 +66,15 @@ data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
 # separately with `modal secret create glc-llm-keys ...` (mock values for now).
 llm_secret = modal.Secret.from_name("glc-llm-keys")
 
+# The gateway bearer token (A1) lives in its own Secret, separate from the
+# provider keys — a distinct credential per surface.
+auth_secret = modal.Secret.from_name("glc-gateway-auth")
+
 
 @app.function(
     image=image,
     volumes={"/data": data_volume},
-    secrets=[llm_secret],
+    secrets=[llm_secret, auth_secret],
     min_containers=0,  # scale to zero when idle -> protects the free tier
 )
 @modal.asgi_app()
