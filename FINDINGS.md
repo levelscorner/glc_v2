@@ -113,3 +113,31 @@ Token/cost budgets ride on the cost ledger and are a documented follow-up.
 
 **Verify:** cap 3 → `[400,400,400,429,429]` on `/v1/embed`; `/healthz`
 unthrottled; 249/249 tests pass.
+
+## C3 — WS install token in the query string  ·  invariant 4  ·  MEDIUM
+
+**Reproduce:** `WS /v1/channels/{name}?token=<install_token>` — the token lands
+in access logs, proxy logs, and browser history.
+
+**Fix:** `glc/routes/channels.py` — accept the token only from the
+`Authorization: Bearer` header; the `?token=` fallback is off unless
+`GLC_ALLOW_WS_QUERY_TOKEN=1`. Comparison is constant-time (`hmac.compare_digest`).
+
+**Verify:** header auth still connects; query-token rejected by default; existing
+control-plane/WS tests (header-based) still pass.
+
+## Leak 2 / A6 — Audit log tamperable at the OS layer  ·  invariant 7  ·  HIGH
+
+**Reproduce:** the app layer exposes only `append()`, but the SQLite file is
+writable, so in-process code runs
+`sqlite3.connect(path).execute("DELETE FROM audit_log")` and erases history.
+
+**Fix:** `glc/audit/` — every row now carries `prev_hash` and
+`row_hash = sha256(prev_hash ‖ canonical row)`, chained from a genesis value.
+`verify_chain()` recomputes the chain and returns the first broken id, so a
+deleted, edited, or truncated log is detectable even when the raw file is
+tampered with. Appends are serialized with a lock (intra-process); a single
+cross-container append-only writer is the deeper A6 fix (documented).
+
+**Verify:** 5 clean appends → chain OK; `DELETE id=3` → detected (first_bad=4);
+`UPDATE id=1` → detected (first_bad=1). 249/249 tests pass.

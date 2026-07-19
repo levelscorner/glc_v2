@@ -12,7 +12,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     tool            TEXT,
     policy_verdict  TEXT,
     params_json     TEXT,
-    result_json     TEXT
+    result_json     TEXT,
+    -- Leak 2 fix: tamper-evident hash chain. row_hash =
+    -- sha256(prev_hash || canonical row content); a deleted or edited row
+    -- breaks the chain and verify_chain() reports the first bad id.
+    prev_hash       TEXT,
+    row_hash        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
