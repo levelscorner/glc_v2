@@ -9,14 +9,38 @@ separate append-only store under glc/audit/store.py.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
+_log = logging.getLogger("glc.db")
+
 DEFAULT_DIR = Path(os.path.expanduser("~/.glc"))
 DB_PATH = os.getenv("GLC_GATEWAY_DB", str(DEFAULT_DIR / "gateway.sqlite"))
+
+# Leak 10 fix: the cost ledger must not accept unbounded counts. A caller
+# supplying input_tokens=999_999_999 poisons /v1/cost/by_agent and can wipe a
+# month's provider budget on paper. Clamp count-like fields to sane ceilings
+# and log any out-of-range value so poisoning attempts are visible.
+_MAX_TOKENS = 10_000_000  # generous per-call ceiling; real calls are far below
+_MAX_CHARS = 50_000_000
+_MAX_SMALL = 100_000  # tool_calls, retries
+_MAX_LATENCY_MS = 24 * 3600 * 1000  # 24h
+
+
+def _bounded(name: str, val, hi: int, lo: int = 0) -> int:
+    try:
+        v = int(val)
+    except (TypeError, ValueError):
+        _log.warning("log_call: %s=%r is not an int; using %d", name, val, lo)
+        return lo
+    if v < lo or v > hi:
+        _log.warning("log_call: %s=%r out of range [%d, %d]; clamped", name, val, lo, hi)
+        return max(lo, min(v, hi))
+    return v
 
 
 def _ensure_parent() -> None:
@@ -96,6 +120,16 @@ def log_call(
     session=None,
     retries=0,
 ) -> None:
+    # Leak 10 fix: clamp caller-supplied counts before they hit the ledger.
+    input_tokens = _bounded("input_tokens", input_tokens, _MAX_TOKENS)
+    output_tokens = _bounded("output_tokens", output_tokens, _MAX_TOKENS)
+    cache_create_tokens = _bounded("cache_create_tokens", cache_create_tokens, _MAX_TOKENS)
+    cache_read_tokens = _bounded("cache_read_tokens", cache_read_tokens, _MAX_TOKENS)
+    prompt_chars = _bounded("prompt_chars", prompt_chars, _MAX_CHARS)
+    response_chars = _bounded("response_chars", response_chars, _MAX_CHARS)
+    tool_calls = _bounded("tool_calls", tool_calls, _MAX_SMALL)
+    retries = _bounded("retries", retries, _MAX_SMALL)
+    latency_ms = _bounded("latency_ms", latency_ms, _MAX_LATENCY_MS)
     with conn() as c:
         c.execute(
             """INSERT INTO calls (ts, provider, model, input_tokens, output_tokens,

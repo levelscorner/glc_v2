@@ -31,8 +31,15 @@ from glc.routes import control as control_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
+from glc.security.gateway_auth import GatewayAuthMiddleware  # noqa: E402
+from glc.security.http_ratelimit import DataPlaneRateLimitMiddleware  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
+
+# A2 fix: disable the OpenAPI schema + Swagger/ReDoc explorers in the public
+# deployment so the full route map, models, and limits are not handed out.
+# Set GLC_DISABLE_DOCS=1 on Modal; left on for local dev.
+_DOCS_DISABLED = os.getenv("GLC_DISABLE_DOCS") == "1"
 
 
 def _install_sighup_reload() -> None:
@@ -73,7 +80,22 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="GLC v1 — Gateway for LLMs and Channels", lifespan=lifespan)
+app = FastAPI(
+    title="GLC v1 — Gateway for LLMs and Channels",
+    lifespan=lifespan,
+    docs_url=None if _DOCS_DISABLED else "/docs",
+    redoc_url=None if _DOCS_DISABLED else "/redoc",
+    openapi_url=None if _DOCS_DISABLED else "/openapi.json",
+)
+
+# A1 fix: require a scoped bearer token on the data plane + info endpoints when
+# GLC_REQUIRE_AUTH=1 (set on the public Modal deployment).
+app.add_middleware(GatewayAuthMiddleware)
+
+# C5 fix: per-client-IP rate limit on the data plane. Added after the auth
+# middleware so it runs first (Starlette runs last-added outermost), throttling
+# floods before they reach auth.
+app.add_middleware(DataPlaneRateLimitMiddleware)
 
 app.include_router(chat_route.router)
 app.include_router(transcribe_route.router)

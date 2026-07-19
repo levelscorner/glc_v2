@@ -34,14 +34,18 @@ router = APIRouter()
 
 @router.websocket("/v1/channels/{name}")
 async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(default=None)):
+    # C3 fix: the install token must arrive in the Authorization header. A
+    # token in the query string (?token=) is written to access logs, proxy
+    # logs, and browser history. The query fallback is disabled unless an
+    # operator explicitly re-enables it for a legacy client.
     header_auth = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
     presented = None
     if header_auth and header_auth.startswith("Bearer "):
         presented = header_auth.removeprefix("Bearer ").strip()
-    elif token:
+    elif token and os.getenv("GLC_ALLOW_WS_QUERY_TOKEN") == "1":
         presented = token
     expected = get_or_create_install_token()
-    if presented != expected:
+    if not presented or not hmac.compare_digest(presented, expected):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
@@ -65,6 +69,24 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
             except Exception as e:
                 await websocket.send_text(json.dumps({"error": f"invalid envelope: {e}"}))
                 continue
+
+            # Leak 9 fix: the envelope's declared channel must match the route
+            # it arrived on. Without this, an adapter connected to
+            # /v1/channels/telegram can send env.channel="discord" and
+            # impersonate another channel. Reject, record, and close.
+            if env.channel != name:
+                audit_append(
+                    channel=name,
+                    channel_user_id=env.channel_user_id,
+                    trust_level=env.trust_level,
+                    event_type="channel_spoof",
+                    result={"declared_channel": env.channel, "route": name},
+                )
+                await websocket.send_text(
+                    json.dumps({"error": f"channel mismatch: envelope declares {env.channel!r} on route {name!r}"})
+                )
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
 
             ok, why = allowed(
                 env.channel,
@@ -144,6 +166,18 @@ async def channel_webhook(name: str, request: Request):
     msg = await adapter.on_message(raw)
     if msg is None:
         return {"status": "ok"}
+
+    # Leak 9 fix (webhook path): an adapter must not emit an envelope for a
+    # channel other than the route it is mounted on.
+    if msg.channel != name:
+        audit_append(
+            channel=name,
+            channel_user_id=msg.channel_user_id,
+            trust_level=msg.trust_level,
+            event_type="channel_spoof",
+            result={"declared_channel": msg.channel, "route": name},
+        )
+        raise HTTPException(status_code=400, detail="channel mismatch")
 
     limiter = get_rate_limiter()
     pairings = get_pairing_store()

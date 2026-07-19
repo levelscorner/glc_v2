@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -285,25 +286,50 @@ def _required_caps(req: ChatRequest):
     return caps
 
 
+_log = logging.getLogger("glc.chat")
+
+
 async def _resolve_image_urls(messages):
     import base64
 
     import httpx as _httpx
 
+    from glc.security.ssrf import check_url_allowed
+
+    _MAX_REDIRECTS = 5
+
     async def _fetch_to_data_url(url: str) -> str:
+        # C1 fix: SSRF guard. Validate the target host resolves to a global
+        # address (and passes any allowlist) before every hop, and follow
+        # redirects manually so a public URL cannot 302 into the private net.
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        current = url
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
+            for _ in range(_MAX_REDIRECTS + 1):
+                ok, why = check_url_allowed(current)
+                if not ok:
+                    raise HTTPException(400, f"blocked image url: {why}")
+                try:
+                    r = await c.get(current)
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
+                if r.is_redirect:
+                    loc = r.headers.get("location", "")
+                    if not loc:
+                        raise HTTPException(400, f"redirect without location for {url!r}")
+                    current = str(r.url.join(loc))
+                    continue
+                try:
+                    r.raise_for_status()
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
+                mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+                b64 = base64.b64encode(r.content).decode()
+                return f"data:{mt};base64,{b64}"
+            raise HTTPException(400, f"too many redirects fetching image url {url!r}")
 
     out = []
     for m in messages:
@@ -605,7 +631,8 @@ async def chat(req: ChatRequest, request: Request):
                 tag += f" → backoff {secs:.0f}s ({reason})"
             all_attempts.append({"provider": name, "reason": tag})
             if explicit_override or not getattr(e, "retryable", True):
-                raise HTTPException(502, f"{name} failed: {e}")
+                _log.warning("chat upstream failure provider=%s: %r", name, e)
+                raise HTTPException(502, "upstream provider error") from None
             candidates = [c for c in candidates if c != name]
             continue
         except HTTPException:
@@ -630,11 +657,13 @@ async def chat(req: ChatRequest, request: Request):
             )
             all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
             if explicit_override:
-                raise HTTPException(502, f"{name} failed: {e}")
+                _log.warning("chat upstream failure provider=%s: %r", name, e)
+                raise HTTPException(502, "upstream provider error") from None
             candidates = [c for c in candidates if c != name]
             continue
 
-    raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
+    _log.warning("all providers unavailable: attempts=%s last_error=%s", all_attempts, last_err)
+    raise HTTPException(503, "all upstream providers unavailable")
 
 
 @router.post("/v1/chat/batch")
@@ -711,11 +740,12 @@ async def embed(req: EmbedRequest, request: Request):
             call_role="embed",
         )
         if req.provider:
+            _log.warning("embed upstream failure provider=%s status=%s: %r", req.provider, e.status, e)
             if e.status == 429:
-                raise HTTPException(429, f"{req.provider} rate-limited: {e}")
+                raise HTTPException(429, "upstream rate limited") from None
             if e.status == 400:
-                raise HTTPException(400, str(e))
-            raise HTTPException(502, f"{req.provider} embed failed: {e}")
+                raise HTTPException(400, "invalid embed request") from None
+            raise HTTPException(502, "upstream embed error") from None
         raise HTTPException(503, str(e))
 
     db.log_call(

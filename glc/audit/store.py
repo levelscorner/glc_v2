@@ -11,15 +11,56 @@ Each append commits immediately so writes survive a hard kill.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 DEFAULT_DIR = Path(os.path.expanduser("~/.glc"))
+
+# Leak 2 fix: hash-chain constants. The app layer already refuses UPDATE/DELETE,
+# but the SQLite file is writable at the OS layer, so in-process code can wipe
+# it directly. Chaining each row to its predecessor makes any deletion or edit
+# detectable even when the raw file is tampered with.
+_GENESIS = "0" * 64
+_append_lock = threading.Lock()
+
+
+def _row_digest(
+    prev_hash: str,
+    ts: float,
+    session_id: str | None,
+    channel: str,
+    channel_user_id: str,
+    trust_level: str,
+    event_type: str,
+    tool: str | None,
+    policy_verdict: str | None,
+    params_json: str | None,
+    result_json: str | None,
+) -> str:
+    payload = json.dumps(
+        [
+            prev_hash,
+            ts,
+            session_id,
+            channel,
+            channel_user_id,
+            trust_level,
+            event_type,
+            tool,
+            policy_verdict,
+            params_json,
+            result_json,
+        ],
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _resolve_path() -> str:
@@ -46,6 +87,13 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 def init_store() -> None:
     with _conn() as c:
         c.executescript(_SCHEMA_PATH.read_text())
+        # Defensive migration: add the hash-chain columns to a pre-existing DB
+        # created before leak 2 was fixed. No-op if they already exist.
+        for col in ("prev_hash", "row_hash"):
+            try:
+                c.execute(f"ALTER TABLE audit_log ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
 
 
 def _jsonify(v: Any) -> str | None:
@@ -77,14 +125,27 @@ class AuditStore:
         params: Any = None,
         result: Any = None,
     ) -> int:
-        with _conn() as c:
+        ts = time.time()
+        params_json = _jsonify(params)
+        result_json = _jsonify(result)
+        # Serialize the read-prev-then-insert so concurrent appends in this
+        # process cannot fork the chain. (Cross-process/container writers still
+        # race — that is A6's deeper fix: a single append-only writer.)
+        with _append_lock, _conn() as c:
+            row = c.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+            prev_hash = row["row_hash"] if row and row["row_hash"] else _GENESIS
+            row_hash = _row_digest(
+                prev_hash, ts, session_id, channel, channel_user_id,
+                trust_level, event_type, tool, policy_verdict, params_json, result_json,
+            )
             cur = c.execute(
                 """INSERT INTO audit_log
                    (ts, session_id, channel, channel_user_id, trust_level,
-                    event_type, tool, policy_verdict, params_json, result_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    event_type, tool, policy_verdict, params_json, result_json,
+                    prev_hash, row_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    time.time(),
+                    ts,
                     session_id,
                     channel,
                     channel_user_id,
@@ -92,8 +153,10 @@ class AuditStore:
                     event_type,
                     tool,
                     policy_verdict,
-                    _jsonify(params),
-                    _jsonify(result),
+                    params_json,
+                    result_json,
+                    prev_hash,
+                    row_hash,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -135,3 +198,25 @@ def schema_version() -> int:
     with _conn() as c:
         row = c.execute("SELECT MAX(version) AS v FROM audit_schema").fetchone()
         return int(row["v"] or 0)
+
+
+def verify_chain() -> tuple[bool, int | None]:
+    """Recompute the hash chain in id order. Returns ``(ok, first_bad_id)``.
+
+    Detects a deleted row (the next row's ``prev_hash`` no longer matches),
+    an edited field (the recomputed ``row_hash`` differs), or a truncated
+    tail. ``first_bad_id`` is the id where the chain first breaks, or None.
+    """
+    prev = _GENESIS
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM audit_log ORDER BY id ASC").fetchall()
+    for r in rows:
+        expected = _row_digest(
+            prev, r["ts"], r["session_id"], r["channel"], r["channel_user_id"],
+            r["trust_level"], r["event_type"], r["tool"], r["policy_verdict"],
+            r["params_json"], r["result_json"],
+        )
+        if r["prev_hash"] != prev or r["row_hash"] != expected:
+            return False, int(r["id"])
+        prev = r["row_hash"]
+    return True, None
